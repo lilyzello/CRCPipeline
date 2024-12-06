@@ -1,0 +1,106 @@
+#!/bin/bash
+
+. /u/local/Modules/default/init/modules.sh
+module load sra-tools
+
+#Download Files
+while IFS= read -r line; do
+    # Use prefetch for each line
+    prefetch "$line"
+done < SRR_Acc_List.txt
+
+while IFS= read -r line; do
+    fasterq-dump --split-files "${line}/${line}.sra"
+    gzip "${line}_1.fastq" "${line}_2.fastq"
+    echo "Finished sample ${line}"
+    rm -vr "${line}"
+done < SRR_Acc_List.txt
+
+#Index Genome
+module load star
+STAR --runThreadN 8 --runMode genomeGenerate \
+     --genomeDir [YOUR GENOME DIRECTORY HERE] \
+     --genomeFastaFiles [YOUR GENOME FILE HERE]
+
+#Run FastQC
+module load fastqc
+sample_list=[PATH TO SAMPLE LIST]
+input_dir=[PATH TO SAMPLES]
+subset_dir=[PATH TO SUBSET DIRECTORY]
+
+while read -r sample_id; do
+    input1="${input_dir}/${sample_id}_1.fastq.gz"
+    input2="${input_dir}/${sample_id}_2.fastq.gz"
+
+    subset1="${subset_dir}/subset_${sample_id}_1.fastq.gz"
+    subset2="${subset_dir}/subset_${sample_id}_2.fastq.gz"
+
+    zcat "$input1" | head -n 40000 | gzip > "$subset1"
+    zcat "$input2" | head -n 40000 | gzip > "$subset2"
+
+    fastqc "$subset1" "$subset2" -o "$output_dir"
+
+    rm "$subset1" "$subset2"
+
+done < "$sample_list"
+
+#Trim adapter sequences
+module load python
+trimmed_output_dir=[PATH TO TRIMMED SEQUENCE]
+
+while read -r sample_id; do
+    input_file1="${input_dir}/${sample_id}_1.fastq.gz"
+    input_file2="${input_dir}/${sample_id}_2.fastq.gz"
+    output_file1="${trimmed_output_dir}/${sample_id}_1_trimmed.fastq.gz"
+    output_file2="${trimmed_output_dir}/${sample_id}_2_trimmed.fastq.gz"
+    report_file="${sample_id}_report.txt"
+
+    cutadapt --pair-filter any -j 4 -q 30,30 \
+        -a "[ADAPTER SEQ1]" -A "[ADAPTER SEQ2]" --trim-n -m 16 \
+        -o "$output_file1" -p "$output_file2" "$input_file1" "$input_file2" > "$report_file"
+done < "$sample_list"
+
+#Align Samples using Star
+module load star/2.7.10a
+
+Path2Index=[PATH TO INDEXED GENOME]
+output_dir=[PATH TO ALIGNED OUTPUT DIRECTORY]
+samples_dir=[PATH TO SAMPLE DIRECTORY]
+
+for r1_file in "$samples_dir"/*_1_trimmed.fastq.gz; do
+    sample=$(basename "$r1_file" _1_trimmed.fastq.gz)
+    r2_file="${samples_dir}/${sample}_2_trimmed.fastq.gz"
+    pfx="${sample}"
+
+    STAR --genomeDir "$Path2Index" \
+         --readFilesCommand zcat \
+         --readFilesIn "$r1_file" "$r2_file" \
+         --outSAMtype BAM SortedByCoordinate \
+         --outFilterMultimapNmax 10 \
+         --outSAMmultNmax 1 \
+         --runThreadN 4 \
+         --outFileNamePrefix "${output_dir}/${pfx}_" \
+         --outFilterMismatchNoverReadLmax 0.02 \
+         --outFilterMismatchNmax 999
+done
+
+#Count kmers using Jellyfish
+module load jellyfish
+readDir=[PATH TO TRIMMED SAMPLE DIRECTORY]
+outputDir=[PATH TO JELLYFISH OUTPUT DIRECTORY]
+
+for filepath in "${readDir}"*_1_trimmed.fastq.gz; do
+    filename=$(basename "$filepath")
+    pfx="${filename%%_1_trimmed.fastq.gz}"
+
+    zcat "${filepath}" | jellyfish bc /dev/fd/0 -m 11 -s 2G -t 6 -o "${outputDir}""${pfx}""_11mer.bc"
+
+    zcat "${filepath}" | jellyfish count -m 11 -s 2G -t 6 --bc "${outputDir}""${pfx}""_11mer.bc" -o $
+
+    $jellyfishBin dump "${outputDir}""${pfx}""_11mer.jf" -o "${outputDir}""${pfx}""_11mer_count.tsv"
+
+    rm "${outputDir}""${pfx}""_11mer.bc"
+
+    gzip "${outputDir}""${pfx}""_11mer_count.tsv"
+
+done
